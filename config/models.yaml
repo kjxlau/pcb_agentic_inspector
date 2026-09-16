@@ -1,0 +1,17 @@
+models:
+  feature:
+    path: models/feature/model.onnx
+    labels: models/feature/labels.json
+    input_size: [224, 224]
+  body:
+    path: models/body/model.onnx
+    labels: models/body/labels.json
+    input_size: [640, 640]
+  lead:
+    path: models/lead/model.onnx
+    labels: models/lead/labels.json
+    input_size: [640, 640]
+  text:
+    path: models/text/model.onnx
+    labels: models/text/labels.json
+    input_size: [480, 480]
