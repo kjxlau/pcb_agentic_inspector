@@ -139,12 +139,6 @@ OPENAI_API_KEY=sk-proj-yourActualKeyHere
 OPENAI_MODEL=gpt-4o
 ```
 
-### 4. Build Telemetry Database
-Pre-generate the 3D laser height and electrical measurement indices:
-```bash
-python src/agent2_explainability/generate_telemetry.py
-```
-
 ---
 
 ## 🚀 Two-Terminal Execution Workflow
