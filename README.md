@@ -299,4 +299,3 @@ The runner automatically recovers image paths when files are moved or when `data
 
 * **Human-in-the-Loop (HITL):** If Agent 2 detects an irreconcilable visual/physical contradiction or if `self_check_passed == False`, the workflow status becomes `HUMAN_QA_REQUIRED` and routes the case to the QA review queue.
 * **Continuous Learning:** Verified escalated cases can be indexed back into the local `qdrant_db` collection to expand historical retrieval accuracy for future runs.
-* **Industrial SMT Line Integration:** In `generate_telemetry.py`, replace simulated/lookup files with direct SECS/GEM or OPC-UA protocols streaming real-time measurements from inline 3D AOI and ICT equipment.
