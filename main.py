@@ -2,6 +2,7 @@
 Unified End-to-End PCB Inspection Runner.
 Recursively explores inspection images across all board assemblies in data/inputs,
 evaluates policy gates, and dispatches ambiguous cases to Agent 2 via A2A protocol.
+Supports vector database indexing into local Qdrant (qdrant_db).
 """
 
 from __future__ import annotations
@@ -17,6 +18,15 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
+
+# Safe import of Qdrant vector database indexer
+try:
+    from src.data.qdrant_indexer import populate_qdrant_db
+except ImportError:
+    try:
+        from data.qdrant_indexer import populate_qdrant_db
+    except ImportError:
+        populate_qdrant_db = None
 
 # Load environment variables (.env)
 load_dotenv()
@@ -153,7 +163,6 @@ def auto_discover_dataset(image_root: str = "data/inputs") -> List[Dict[str, Any
             base_conf = 0.98
 
         # --- Smart Golden Pairing ---
-        # Sibling Golden directory (e.g., .../<BoardID>/<Feature>/Golden/)
         golden_path = None
         golden_dir = img.parent.parent / "Golden"
         if golden_dir.is_dir():
@@ -231,6 +240,19 @@ def main():
     parser.add_argument("--confidence-threshold", type=float, default=0.85, help="Minimum baseline confidence")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of samples to process (e.g., --limit 10)")
     parser.add_argument("--batch-size", type=int, default=5, help="Number of samples per batch (e.g., --batch-size 5)")
+    
+    # --- Vector Database Flags ---
+    parser.add_argument(
+        "--populate-vector-db",
+        action="store_true",
+        help="Index all loaded/discovered samples into the local Qdrant vector database (qdrant_db)"
+    )
+    parser.add_argument(
+        "--qdrant-path",
+        default="qdrant_db",
+        help="Target folder for local embedded Qdrant database (default: qdrant_db)"
+    )
+
     args = parser.parse_args()
 
     print("=" * 75)
@@ -244,12 +266,24 @@ def main():
     else:
         logger.warning(f"Agent 2 NOT responding at {args.agent2_url}. Escalated cases will be marked for Human Review.")
 
-    # 2. Ingest Dataset (Auto-Exploration)
+    # 2. Ingest Dataset (Auto-Exploration or CSV/XML)
     samples = load_samples(args.dataset, args.xml, args.image_root)
 
     if not samples:
         logger.error(f"No valid inspection images found in '{args.image_root}'. Exiting.")
         return
+
+    # --- Step 2.5: Populate Vector Database if requested ---
+    if args.populate_vector_db:
+        if populate_qdrant_db is not None:
+            logger.info(f"Indexing {len(samples)} samples into Qdrant vector DB at '{args.qdrant_path}'...")
+            try:
+                indexed_count = populate_qdrant_db(samples, db_path=args.qdrant_path)
+                logger.info(f" -> Qdrant vector DB successfully indexed with {indexed_count} samples.")
+            except Exception as ex:
+                logger.error(f" -> Failed to populate Qdrant vector DB: {ex}")
+        else:
+            logger.warning(" -> Qdrant indexer module ('populate_qdrant_db') not found. Skipping vector indexing.")
 
     # Apply sample limit (if requested)
     if args.limit and args.limit > 0:
@@ -290,12 +324,12 @@ def main():
             if defect_path and Path(defect_path).is_file():
                 logger.info(f" -> Defect image: {Path(defect_path).name}")
             else:
-                logger.warning(f" -> Defect image missing on disk.")
+                logger.warning(" -> Defect image missing on disk.")
 
             if golden_path and Path(golden_path).is_file():
                 logger.info(f" -> Golden image: {Path(golden_path).name}")
             else:
-                logger.info(f" -> Golden image: None (Unpaired)")
+                logger.info(" -> Golden image: None (Unpaired)")
 
             # --- Agent 1 Baseline Inference ---
             defect_class = s.get("defect_hint", "NoDefect")
