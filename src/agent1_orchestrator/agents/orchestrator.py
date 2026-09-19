@@ -1,3 +1,14 @@
+"""
+Agent 1 Orchestrator Agent.
+Coordinates dataset preparation, verification, fast ONNX inference,
+policy validation, vector database indexing, and A2A escalation to Agent 2.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, Optional
+
 from planner.llm_planner import Planner
 from policy.policy_engine import PolicyEngine
 from state.workflow_state import WorkflowState
@@ -6,6 +17,26 @@ from services.dataset_verification import DatasetVerificationService
 from services.model_lifecycle import ModelLifecycleService
 from services.multimodal_inference import TwoStageInferenceService
 from services.result_comparison import final_decision
+
+# Import Agent 2 A2A Dispatcher
+try:
+    from agents.a2a_dispatcher import Agent2ReviewClient
+except ImportError:
+    try:
+        from src.agent1_orchestrator.agents.a2a_dispatcher import Agent2ReviewClient
+    except ImportError:
+        Agent2ReviewClient = None
+
+# Import Qdrant Vector DB Indexer
+try:
+    from src.data.qdrant_indexer import populate_qdrant_db
+except ImportError:
+    try:
+        from data.qdrant_indexer import populate_qdrant_db
+    except ImportError:
+        populate_qdrant_db = None
+
+logger = logging.getLogger("OrchestratorAgent")
 
 
 class OrchestratorAgent:
@@ -22,13 +53,16 @@ class OrchestratorAgent:
 
     def __init__(
         self,
-        project_root,
-        feature_threshold=0.70,
-        defect_threshold=0.70,
-        use_llm=False,
-        planner_model=None,
-        allow_llm_fallback=True,
-        max_replans=8,
+        project_root: str,
+        feature_threshold: float = 0.70,
+        defect_threshold: float = 0.70,
+        use_llm: bool = False,
+        planner_model: Optional[str] = None,
+        allow_llm_fallback: bool = True,
+        max_replans: int = 8,
+        agent2_url: str = "http://127.0.0.1:8001",
+        enable_a2a: bool = True,
+        populate_vector_db: bool = True,
     ):
         self.planner = Planner(
             use_llm=use_llm,
@@ -44,7 +78,14 @@ class OrchestratorAgent:
         self.max_replans = max_replans
         self.use_llm = use_llm
 
-    def run(self, dataset_csv, inspection_xml, image_root=None):
+        # A2A Review Client Configuration
+        self.enable_a2a = enable_a2a
+        self.a2a_client = Agent2ReviewClient(agent2_url=agent2_url) if (enable_a2a and Agent2ReviewClient) else None
+
+        # Vector Database Population
+        self.populate_vector_db = populate_vector_db
+
+    def run(self, dataset_csv: str, inspection_xml: str, image_root: Optional[str] = None) -> WorkflowState:
         state = WorkflowState(
             status="RUNNING",
             inputs={
@@ -150,7 +191,7 @@ class OrchestratorAgent:
         state.current_step = None
         return state
 
-    def _execute_preparation(self, state):
+    def _execute_preparation(self, state: WorkflowState) -> Dict[str, Any]:
         prep = self.preparation.prepare(
             state.inputs["dataset_csv"],
             state.inputs["inspection_xml"],
@@ -160,6 +201,16 @@ class OrchestratorAgent:
         state.input_samples = prep.metrics.get("total_samples", len(state.prepared_samples))
         state.preparation_ready = prep.metrics.get("ready_samples", 0)
         state.preparation_failed = prep.metrics.get("failed_samples", 0)
+
+        # Automatically populate the local Qdrant Vector Database with the prepared data
+        if state.prepared_samples and self.populate_vector_db and populate_qdrant_db:
+            try:
+                indexed_count = populate_qdrant_db(state.prepared_samples, db_path="qdrant_db")
+                state.observations.append(
+                    f"Vector Database: Indexed {indexed_count} historical records into qdrant_db."
+                )
+            except Exception as ex:
+                state.observations.append(f"Vector Database indexing notice: {ex}")
 
         state.observations.append(
             f"Dataset preparation: {state.preparation_ready}/{state.input_samples} READY; "
@@ -175,10 +226,9 @@ class OrchestratorAgent:
                 "termination_reason": "NO_INPUT_SAMPLES",
             }
 
-        # Partial preparation is recoverable; verification decides what can proceed.
         return {"status": prep.status, "success": prep.success}
 
-    def _execute_verification(self, state):
+    def _execute_verification(self, state: WorkflowState) -> Dict[str, Any]:
         verify = self.verification.verify(state.prepared_samples)
         state.verified_samples = verify.data.get("verified_samples", [])
         state.verification_passed = verify.metrics.get("passed_samples", 0)
@@ -202,7 +252,7 @@ class OrchestratorAgent:
 
         return {"status": verify.status, "success": verify.success}
 
-    def _execute_inference(self, state):
+    def _execute_inference(self, state: WorkflowState) -> Dict[str, Any]:
         state.inference_attempted = len(state.verified_samples)
 
         for sample in state.verified_samples:
@@ -212,7 +262,6 @@ class OrchestratorAgent:
                 payload = result.data
                 payload["status"] = result.status
                 payload["final_decision"] = final_decision(result, self.defect_threshold)
-                state.inference_results.append(payload)
                 state.inference_completed += 1
             else:
                 decision = "REVIEW_REQUIRED" if result.recoverable else "ABORTED"
@@ -223,9 +272,14 @@ class OrchestratorAgent:
                     "details": result.data,
                     "final_decision": decision,
                 }
-                state.inference_results.append(payload)
                 if decision == "ABORTED":
                     state.inference_aborted += 1
+
+            # Check if escalation to Agent 2 is needed
+            if payload.get("final_decision") == "REVIEW_REQUIRED" and self.enable_a2a:
+                self._execute_review_escalation(state, sample, payload)
+
+            state.inference_results.append(payload)
 
         state.accepted = sum(
             1 for r in state.inference_results if r.get("final_decision") == "ACCEPTED"
@@ -238,7 +292,7 @@ class OrchestratorAgent:
         )
 
         state.observations.append(
-            f"Inference attempted {state.inference_attempted} sample(s): "
+            f"Inference completed {state.inference_attempted} sample(s): "
             f"{state.accepted} accepted, {state.review_required} review-required, "
             f"{state.inference_aborted} aborted."
         )
@@ -250,7 +304,59 @@ class OrchestratorAgent:
             "termination_reason": "NO_INFERENCE_RESULTS",
         }
 
-    def _finalize(self, state):
+    def _execute_review_escalation(
+        self, state: WorkflowState, sample: Dict[str, Any], inference_result: Dict[str, Any]
+    ) -> None:
+        """
+        Delegates an ambiguous/low-confidence sample to Agent 2 over A2A protocol.
+        """
+        if not self.a2a_client:
+            state.observations.append("A2A Client is disabled or unconfigured; skipping escalation.")
+            return
+
+        sample_id = sample.get("sample_id", "UNKNOWN")
+
+        # Discover Agent 2 availability
+        if not self.a2a_client.discover():
+            inference_result["resolved_by"] = "AGENT2_UNAVAILABLE"
+            state.observations.append(
+                f"Agent 2 server offline; sample {sample_id} retained as REVIEW_REQUIRED."
+            )
+            return
+
+        state.observations.append(f"Escalating sample {sample_id} to Agent 2 via A2A protocol...")
+
+        # Transmit A2A Review Task
+        review_response = self.a2a_client.delegate_review(sample, inference_result)
+        artifact = review_response.get("artifact") or review_response.get("result", {})
+
+        inference_result["agent2_review"] = artifact
+
+        if artifact.get("self_check_passed"):
+            # Ambiguity successfully grounded with physical telemetry and VLM
+            inference_result["final_defect"] = artifact.get("predicted_defect")
+            inference_result["diagnosis"] = artifact.get("diagnosis")
+            inference_result["resolved_by"] = "Agent2_Multimodal"
+            inference_result["final_decision"] = "ACCEPTED"
+
+            state.observations.append(
+                f"Agent 2 RESOLVED {sample_id} as '{inference_result['final_defect']}'. Diagnosis: {inference_result['diagnosis']}"
+            )
+            if hasattr(state, "mark_accepted"):
+                state.mark_accepted(sample_id)
+        else:
+            # Physical or visual contradiction persists; flag for Human-in-the-Loop review
+            inference_result["diagnosis"] = artifact.get("diagnosis", "Multimodal self-check contradiction.")
+            inference_result["resolved_by"] = "HUMAN_QA_REQUIRED"
+            inference_result["final_decision"] = "REVIEW_REQUIRED"
+
+            state.observations.append(
+                f"Agent 2 FLAGGED {sample_id} for Human Review. Reason: {inference_result['diagnosis']}"
+            )
+            if hasattr(state, "mark_for_human_review"):
+                state.mark_for_human_review(sample_id)
+
+    def _finalize(self, state: WorkflowState) -> None:
         if not state.inference_results:
             state.status = "ABORTED"
             state.termination_reason = "NO_INFERENCE_RESULTS"
@@ -273,29 +379,3 @@ class OrchestratorAgent:
         state.observations.append(
             f"Workflow finalized as {state.status}. Reason={state.termination_reason}."
         )
-
-# Inside agents/orchestrator.py
-from agents.a2a_dispatcher import Agent2ReviewClient
-
-a2a_client = Agent2ReviewClient(agent2_url="http://127.0.0.1:8001")
-
-def execute_review_escalation(state, sample, inference_result):
-    if not a2a_client.discover():
-        state.set_termination("REVIEW_REQUIRED", "AGENT2_UNAVAILABLE")
-        return
-
-    # Call Agent 2 via A2A
-    review_response = a2a_client.delegate_review(sample, inference_result)
-    artifact = review_response.get("artifact", {})
-
-    if artifact.get("self_check_passed"):
-        # The multimodal agent resolved the ambiguity with high confidence
-        inference_result["final_defect"] = artifact.get("predicted_defect")
-        inference_result["diagnosis"] = artifact.get("diagnosis")
-        inference_result["resolved_by"] = "Agent2_Multimodal"
-        state.mark_accepted(sample["sample_id"])
-    else:
-        # Physical or visual contradiction persists; route to human
-        inference_result["diagnosis"] = artifact.get("diagnosis")
-        inference_result["resolved_by"] = "HUMAN_QA_REQUIRED"
-        state.mark_for_human_review(sample["sample_id"])
