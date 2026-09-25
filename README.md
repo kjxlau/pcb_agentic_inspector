@@ -86,10 +86,11 @@ pcb_agentic_inspector/
 ## 3. Prerequisites
 
 1. **Windows 10/11** or **Linux** with **Anaconda / Miniconda**.
-2. **Docker Desktop** (required to run the Qdrant vector database container).
-3. **OpenAI API Key** (for LLM planning and Agent 2 GPT-4o grounding).
-4. *(Optional)* **Ollama with LLaVA** (for local vision analysis; heuristic fallback enabled if offline):
-   ```cmd
+2. **Git**.
+3. **Docker Desktop** (required to run the Qdrant vector database container).
+4. **OpenAI API Key** (for LLM planning and Agent 2 GPT-4o grounding).
+5. *(Optional)* **Ollama with LLaVA** (for local vision analysis; heuristic fallback enabled if offline):
+   ```bash
    ollama run llava
    ```
 
@@ -97,25 +98,25 @@ pcb_agentic_inspector/
 
 ## 4. Installation & Setup
 
-Open your terminal or **Anaconda Prompt** in the project root:
-
-```cmd
-cd /d "C:\Users\<YourUsername>\Desktop\Semicon Agents\pcb_agentic_inspector"
+### 1. Clone the Repository
+```bash
+git clone <YOUR_REPOSITORY_URL>
+cd pcb_agentic_inspector
 ```
 
-### 1. Create and Activate Conda Environment
-```cmd
+### 2. Create and Activate Conda Environment
+```bash
 conda create -n pcb_inspector python=3.11 -y
 conda activate pcb_inspector
 ```
 
-### 2. Install Dependencies
-```cmd
+### 3. Install Dependencies
+```bash
 pip install -r requirements.txt -r requirements-rest.txt
 ```
 
-### 3. Configure `.env`
-Create or update your `.env` file in the project root:
+### 4. Configure `.env`
+Create a `.env` file in the root of the cloned repository (or copy `.env.example` if available):
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4o
@@ -129,9 +130,11 @@ ADC_ENABLE_AGENT2=1
 
 ## 5. Local Execution (3-Terminal Workflow)
 
+Open three separate terminals in the `pcb_agentic_inspector` directory:
+
 ### Terminal 1: Start Qdrant & Shared Data API
-1. Open **Docker Desktop** and ensure it is running.
-2. In your terminal, start the Qdrant container:
+1. Ensure **Docker Desktop** is open and active.
+2. In your project root:
    ```cmd
    conda activate pcb_inspector
    docker compose -f compose.qdrant.yaml up -d
@@ -146,9 +149,8 @@ ADC_ENABLE_AGENT2=1
 ---
 
 ### Terminal 2: Start Agent 2 Explainability API
-Open a second Anaconda Prompt:
+In your project root:
 ```cmd
-cd /d "C:\Users\<YourUsername>\Desktop\Semicon Agents\pcb_agentic_inspector"
 conda activate pcb_inspector
 set ADC_ENABLE_AGENT2=1
 set ADC_DATA_URL=http://127.0.0.1:8000
@@ -159,9 +161,8 @@ python -m uvicorn adc_shared.agent2_api:app --host 127.0.0.1 --port 8001 --worke
 ---
 
 ### Terminal 3: Launch Agent 1 Orchestrator GUI
-Open a third Anaconda Prompt:
+In your project root:
 ```cmd
-cd /d "C:\Users\<YourUsername>\Desktop\Semicon Agents\pcb_agentic_inspector"
 conda activate pcb_inspector
 set ADC_DATA_URL=http://127.0.0.1:8000
 set ADC_AGENT2_URL=http://127.0.0.1:8001
@@ -172,8 +173,8 @@ python src/agent1_orchestrator/ui.py
 
 ## 6. Using the UI & Human-in-the-Loop Conflict Resolution
 
-1. **Select Inputs**:
-   - **Dataset CSV**: `sample_data/dataset.csv` (using relative `inputs/...` paths)
+1. **Select Inputs in UI**:
+   - **Dataset CSV**: `sample_data/dataset.csv` (uses relative `inputs/...` paths)
    - **Inspection XML**: `sample_data/inspection.xml`
    - **Image Folder**: `.` (or leave empty if CSV paths are relative to root)
    - **Output JSON**: `outputs/result.json`
@@ -186,7 +187,7 @@ python src/agent1_orchestrator/ui.py
 
 ### Conflict Resolution Flow
 * **Consensus**: When Agent 1 and Agent 2 agree on the classification, the result is auto-approved and saved to Qdrant.
-* **Conflict**: If Agent 1 and Agent 2 disagree, a **Human Review Dialog** opens:
+* **Conflict**: If Agent 1 and Agent 2 disagree, a **Human Review Dialog** modal opens:
   - Displays side-by-side model outputs (`Agent 1` vs `Agent 2`).
   - Displays the full multimodal diagnosis from LLaVA and GPT-4o.
   - Allows the operator to:
@@ -238,7 +239,7 @@ os.environ["ADC_DATA_URL"] = "http://127.0.0.1:8000"
 os.environ["ADC_AGENT2_URL"] = "http://127.0.0.1:8001"
 os.environ["ADC_ENABLE_AGENT2"] = "1"
 
-# Kill old ports
+# Kill lingering processes on ports
 !fuser -k 6333/tcp 8000/tcp 8001/tcp 2>/dev/null || true
 
 # 1. Start Qdrant Standalone Binary
@@ -284,4 +285,4 @@ Agent 2 (`src/agent2_explainability/mcp/agent2_mcp_server.py`) exposes 4 Model C
 
 ### 3. `HTTP 422: No defect classification available`
 * **Cause**: Agent 1 encountered feature uncertainty (`FEATURE_CLASSIFICATION_UNCERTAIN`) and skipped defect classification.
-* **Fix**: Ensure `adc_shared/agent2_api.py` includes the fallback to `sample.get('machine_defect')` so Agent 2 has a defect category to audit.
+* **Fix**: Ensure `adc_shared/agent2_api.py` includes the fallback to `sample.get('machine_defect')` so Agent 2 has a defect candidate to evaluate.
