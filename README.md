@@ -1,365 +1,227 @@
-# 🔬 Unified Multi-Agent PCB Defect Inspection & Explainability System
+# Agentic ADC – Two-Stage Multi-Agent PCB Inspection System
 
-An industrial-grade, multi-agent inspection system for Printed Circuit Boards (PCBs) conforming to **IPC-A-610 Class 2/3** standards.
+An end-to-end agentic visual inspection and explainability pipeline for printed circuit board (PCB) assembly manufacturing.
 
-The architecture decouples fast edge classification from deep multimodal explainability:
-* **Agent 1 (Orchestrator & Baseline ADC):** Parses AOI XML/CSV metadata, verifies image pairs, automatically populates the vector database, and runs fast ONNX classifiers (Feature classifier $\rightarrow$ Dynamic routing to Body, Lead, or Text models).
-* **Agent 2 (Multimodal Explainability & Review):** Escalation agent running as an independent HTTP microservice on port `8001`. Governed by **LangGraph**, **Ollama LLaVA VLM**, **3D Laser/ICT Telemetry**, and **OpenAI GPT-4o Grounding** to detect physical contradictions and cite IPC standard clauses.
-* **Inter-Agent Communication:** Standard **Agent2Agent (A2A)** Protocol (JSON-RPC 2.0 / HTTP with Agent Card discovery at `/.well-known/agent.json`).
-* **Persistent Vector Memory:** Local embedded **Qdrant** database (`qdrant_db/`) indexing physical telemetry, defect precedents, and IPC clauses.
+The system decouples **Fast-Path Automated Defect Classification (Agent 1 Orchestrator)** from deep **Explainability & Root-Cause Auditing (Agent 2)** via a persistent REST and Vector Database layer (Qdrant).
 
 ---
 
-## 🏛️ System Architecture
+## System Architecture
 
 ```text
-               AOI Inspection XML + CSV Metadata + Image Folders
-                                      │
-                                      ▼
- ┌─────────────────────────────────────────────────────────────────────────────┐
- │                      AGENT 1: CORE ADC & ORCHESTRATOR                       │
- │                                                                             │
- │  1. Auto-Discovery & Ingestion: Recursively scans 120+ boards in data/inputs│
- │  2. Vector Indexer: Embeds & stores inspection records in local Qdrant DB   │
- │  3. Image Verification & Smart Golden-Pairing: Sibling Golden/ matching     │
- │  4. Stage 1: Feature Classifier (224x224 ONNX) ──► Body, Lead, or Text      │
- │  5. Dynamic Routing: Body (640x640), Lead (640x640), or Text (480x480)      │
- │  6. Deterministic Policy Gate: Evaluates confidence & metadata consistency  │
- └──────────────────────────────────────┬──────────────────────────────────────┘
-                                        │
-        ┌───────────────────────────────┴───────────────────────────────┐
-        │                                                               │
-   [Confidence >= Threshold]                                     [REVIEW_REQUIRED]
-        │                                                               │
-        ▼                                                               │ A2A Protocol (HTTP POST :8001)
-   AUTO-ACCEPTED                                                        │ Task: pcb.explainability.audit
-   (Status: COMPLETED)                                                  ▼
- ┌─────────────────────────────────────────────────────────────────────────────┐
- │                 AGENT 2: MULTIMODAL EXPLAINABILITY & REVIEW                 │
- │                           (A2A Server on Port 8001)                         │
- │                                                                             │
- │   Receives A2A Task ──► Executes LangGraph Pipeline with MCP Tools:         │
- │                                                                             │
- │   ┌───────────────────────┐   ┌───────────────────────┐   ┌─────────────┐   │
- │   │  1. Vector DB RAG     │   │  2. Local LLaVA VLM   │   │ 3. Telemetry│   │
- │   │  Qdrant IPC-A-610-C2  │   │  Ollama Visual Inspect│   │ 3D Laser/ICT│   │
- │   └───────────┬───────────┘   └───────────┬───────────┘   └──────┬──────┘   │
- │               └─────────────────────┬─────┴──────────────────────┘          │
- │                                     ▼                                       │
- │                       ┌───────────────────────────┐                         │
- │                       │ 4. Grounding Self-Check   │                         │
- │                       │ GPT-4o Physics Arbitrator │                         │
- │                       └─────────────┬─────────────┘                         │
- └─────────────────────────────────────┼───────────────────────────────────────┘
-                                       │
-                                       ▼
-                              Unified Audit JSON
-       (Resolved Verdict, IPC Citations, Contradiction Flags, Diagnosis)
+┌────────────────────────────────────────────────────────────────────────┐
+│                        AGENT 1: ORCHESTRATOR                           │
+│  • Dataset Preparation & Verification                                  │
+│  • Two-Stage Inference (Feature Classifier → Defect Classifier)        │
+│  • Deterministic Policy Engine & LLM Planner                           │
+│  • Interactive GUI (Tkinter) or Headless CLI (main.py)                 │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ Saves Run State (JSON)
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   SHARED PERSISTENCE & DATA LAYER                      │
+│  • REST Data API (:8000) (FastAPI + Uvicorn)                           │
+│  • Qdrant Vector Database (:6333) (Historical Precedents & Telemetry)  │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ Automatic Review Trigger (POST)
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                 AGENT 2: EXPLAINABILITY REVIEW AGENT                   │
+│  • Service Endpoint (:8001)                                            │
+│  • 4 Model Context Protocol (MCP) Tools:                               │
+│     1. case_context_retrieval_tool  → Precedent Qdrant Vector Search   │
+│     2. visual_evidence_tool         → Local LLaVA ROI Inspection       │
+│     3. measurement_evidence_tool    → ICT / Laser Height Telemetry     │
+│     4. grounding_and_self_check_tool→ OpenAI GPT-4o Strict Verification│
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🏷️ Normalized IPC-A-610 Defect Taxonomy
-
-All predictions from both agents are normalized into 7 standard industrial categories:
-
-| Defect Class | Visual Criteria | Physical Telemetry Ground Truth |
-|---|---|---|
-| **`missing part`** | Empty land pattern / bare solder pads | ICT Open Circuit ($R > 10\text{ M}\Omega$); Laser Height $\approx 0\,\mu\text{m}$ |
-| **`shifted`** | Component rotated or displaced | Side overhang $> 50\%$ (IPC Class 2 violation) |
-| **`foreign material`**| Extraneous solder balls or bridging debris | Surface coplanarity disruption; non-standard conductive path |
-| **`tombstone`** | Part detached, standing vertically | Open circuit with elevated laser profile height ($>100\,\mu\text{m}$) |
-| **`solder insufficient`**| Poor wetting fillet; incomplete pad coverage | Laser fillet thickness below minimum IPC Class 2 threshold |
-| **`wrong part`** | Mismatched component package or markings | Measured capacitance / resistance out of tolerance band |
-| **`no defect`** | Optimal solder fillet and alignment | All electrical and dimensional tolerances satisfied |
-
----
-
-## 📁 Project Structure
+## Directory Structure
 
 ```text
-pcb_agentic_inspection_system/
-├── config/
-│   ├── models.yaml                      # ONNX model specs (224x224, 640x640, 480x480)
-│   ├── policy.yaml                      # Confidence thresholds & loop safety limits
-│   └── agent2_config.yaml               # Qdrant, Ollama, & IPC tolerance thresholds
-├── data/
-│   ├── inputs/                          # 122+ board assembly folders (e.g., 06-200036-02/...)
-│   │   └── 06-200036-02/
-│   │       └── Body/
-│   │           ├── Passed/              # Defect image instances
-│   │           └── Golden/              # Reference Golden images
-│   └── sample_data/                     # dataset.csv and inspection.xml
-├── models/                              # Baseline Single-Image RGB ONNX Classifiers
-│   ├── feature/feature_classifier.onnx  (224x224)
-│   ├── body/body_classifier.onnx        (640x640)
-│   ├── lead/lead_classifier.onnx        (640x640)
-│   └── text/text_classifier.onnx        (480x480)
-├── outputs/
-│   ├── telemetry_by_image.json          # Fast O(1) physical telemetry lookup index
-│   └── result.json                      # Unified final diagnostic audit output
-├── qdrant_db/                           # Persistent local vector store for IPC precedents
+pcb_agentic_inspector/
+├── .env                              # API keys and environment configuration
+├── compose.qdrant.yaml               # Docker Compose file for Qdrant vector database
+├── requirements.txt                  # Core project dependencies
+├── requirements-rest.txt             # REST API and data layer dependencies
+├── auto_review.py                    # Standalone batch review runner
+├── adc_rest.py                       # CLI utility for database queries & runs
+├── main.py                           # Headless batch inspection pipeline
+├── adc_shared/                       # Shared microservices layer
+│   ├── client.py                     # Shared DataClient interface
+│   ├── data_api.py                   # FastAPI service for run & review state (Port 8000)
+│   ├── repository.py                 # Qdrant persistence repository
+│   └── agent2_api.py                 # Agent 2 REST service wrapper (Port 8001)
 ├── src/
-│   ├── agent1_orchestrator/             # AGENT 1: BASELINE & CONTROL
-│   │   ├── agents/
-│   │   │   ├── orchestrator.py          # Workflow loop & A2A escalation caller
-│   │   │   └── a2a_dispatcher.py        # A2A client connecting to Agent 2
-│   │   ├── services/
-│   │   │   ├── dataset_preparation.py   # XML/CSV measurement extraction
-│   │   │   ├── dataset_verification.py  # Image quality & alignment checker
-│   │   │   └── model_lifecycle.py       # ONNX Runtime session cache
-│   │   ├── policy/policy_engine.py      # Deterministic gating engine
-│   │   └── ui.py                        # Tkinter Operator Desktop UI
-│   ├── agent2_explainability/           # AGENT 2: MULTIMODAL REVIEW & EXPLAINABILITY
-│   │   ├── a2a/
-│   │   │   ├── protocol.py              # A2A Task & AgentCard Pydantic schemas
-│   │   │   └── agent2_a2a_server.py     # FastAPI A2A Server (Port 8001)
-│   │   ├── pipeline/
-│   │   │   └── review_graph.py          # LangGraph Multimodal State Machine
-│   │   └── generate_telemetry.py        # 3D AOI & ICT profile builder
-│   └── data/
-│       └── qdrant_indexer.py            # Local vector DB embedding & upsert pipeline
-├── tests/
-│   └── test_agent1_fast_path.py         # Zero-dependency standard library test suite
-├── main.py                              # Unified CLI runner (Batch, Slicing & Qdrant flags)
-├── requirements.txt
-└── .env                                 # Local API keys (OPENAI_API_KEY)
+│   ├── agent1_orchestrator/          # Agent 1 (Orchestrator & GUI)
+│   │   ├── ui.py                     # Main Tkinter graphical user interface
+│   │   ├── agents/                   # Orchestrator agent logic & planner
+│   │   └── services/                 # Dataset preparation & verification
+│   └── agent2_explainability/        # Agent 2 (Explainability & MCP tools)
+│       ├── mcp/
+│       │   └── agent2_mcp_server.py  # FastMCP server & 4 review tools
+│       └── pipeline/
+│           └── review_graph.py       # LangGraph review graph executor
+└── sample_data/                      # Golden & Defect image datasets
 ```
 
 ---
 
-## ⚡ Setup & Installation
+## Prerequisites
 
-### 1. Environment Setup
-Python 3.10+ is recommended:
+1. **Windows 10/11** with **Anaconda / Miniconda**.
+2. **Docker Desktop** (required to run Qdrant).
+3. **OpenAI API Key** (for LLM planning and Agent 2 GPT-4o grounding).
+4. *(Optional)* **Ollama with LLaVA** (for local vision analysis; fallback enabled if offline):
+   ```cmd
+   ollama run llava
+   ```
 
-```bash
-python -m venv .venv
-# Windows (PowerShell):
-.\.venv\Scripts\Activate.ps1
-# Linux/macOS:
-source .venv/bin/activate
+---
 
-pip install --upgrade pip
-pip install -r requirements.txt
+## Environment Setup
+
+Open the **Anaconda Prompt** and navigate to your project root:
+
+```cmd
+cd /d "C:\Users\<YourUsername>\Desktop\Semicon Agents\pcb_agentic_inspector"
 ```
 
-### 2. Pull the Local Vision Model (Ollama)
-Ensure [Ollama](https://ollama.com/) is installed and running:
-```bash
-ollama pull llava
+### 1. Create and Activate Conda Environment
+```cmd
+conda create -n pcb_inspector python=3.11 -y
+conda activate pcb_inspector
+```
+
+### 2. Install Dependencies
+```cmd
+pip install -r requirements.txt -r requirements-rest.txt
 ```
 
 ### 3. Configure `.env`
-Create or edit `.env` in the project root:
+Create or update the `.env` file in the project root:
 ```env
-OPENAI_API_KEY=sk-proj-yourActualKeyHere
+OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4o
+QDRANT_URL=http://127.0.0.1:6333
+ADC_DATA_URL=http://127.0.0.1:8000
+ADC_AGENT2_URL=http://127.0.0.1:8001
+ADC_ENABLE_AGENT2=1
 ```
 
 ---
 
-## 🗄️ Populating the Qdrant Vector Database
+## Running the System (3-Terminal Workflow)
 
-Agent 1 can index all discovered samples and physical telemetry directly into the persistent local vector store (`qdrant_db/`).
+### Terminal 1: Start Qdrant and the Shared Data API
+1. Open **Docker Desktop** and wait until it is running.
+2. In your terminal, start the Qdrant container:
+   ```cmd
+   conda activate pcb_inspector
+   docker compose -f compose.qdrant.yaml up -d
+   ```
+3. Start the Shared Data API on port **8000**:
+   ```cmd
+   set QDRANT_URL=http://127.0.0.1:6333
+   python -m uvicorn adc_shared.data_api:app --host 127.0.0.1 --port 8000 --workers 1
+   ```
+   *Verify in browser: `http://127.0.0.1:8000/health`*
 
-You can populate the database using the standalone indexer:
-```bash
-python -m src.data.qdrant_indexer
-```
-*or automatically during your inspection run using the CLI flag:*
-```bash
-python main.py --populate-vector-db --limit 20
-```
+---
 
-To verify that the vector database is populated:
+### Terminal 2: Start Agent 2 Explainability API
+Open a second Anaconda Prompt:
 ```cmd
-dir qdrant_db
+cd /d "C:\Users\<YourUsername>\Desktop\Semicon Agents\pcb_agentic_inspector"
+conda activate pcb_inspector
+set ADC_ENABLE_AGENT2=1
+set ADC_DATA_URL=http://127.0.0.1:8000
+python -m uvicorn adc_shared.agent2_api:app --host 127.0.0.1 --port 8001 --workers 1
 ```
-You will see the generated collection directories (`collection/`, `meta.json`).
+*Verify in browser: `http://127.0.0.1:8001/health` (should return `{"status": "ok", "execution_enabled": true}`)*
 
 ---
 
-## 🚀 Two-Terminal Execution Workflow
-
-Agent 1 and Agent 2 run as decoupled services communicating over HTTP via the A2A protocol.
-
-### Terminal 1: Start Agent 2 (The Explainability Server)
-```bash
-python -m src.agent2_explainability.a2a.agent2_a2a_server
-```
-Wait until the server starts:
-```text
-INFO: Application startup complete.
-INFO: Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
-```
-
----
-
-### Terminal 2: Run Agent 1 (Unified Runner)
-
-#### Option A: Headless Command-Line Runner (Automatic Image Discovery & Batching)
-```bash
-python main.py --limit 10 --batch-size 5
-```
-
-#### Option B: Real XML & CSV Inspection Run
-```bash
-python main.py \
-  --dataset data/sample_data/dataset.csv \
-  --xml data/sample_data/inspection.xml \
-  --image-root data/inputs \
-  --limit 20 \
-  --batch-size 5
-```
-
-#### Option C: Operator Desktop UI (Tkinter)
-```bash
+### Terminal 3: Launch Agent 1 Orchestrator GUI
+Open a third Anaconda Prompt:
+```cmd
+cd /d "C:\Users\<YourUsername>\Desktop\Semicon Agents\pcb_agentic_inspector"
+conda activate pcb_inspector
+set ADC_DATA_URL=http://127.0.0.1:8000
+set ADC_AGENT2_URL=http://127.0.0.1:8001
 python src/agent1_orchestrator/ui.py
-# On Windows, you can also double-click: run_ui.bat
 ```
 
 ---
 
-## 📦 Batch Execution & Command-Line Arguments
+## Inspecting and Operating the UI
 
-`main.py` provides flags to control dataset exploration, memory chunking, vector indexing, and confidence gating:
+1. **Select Inputs**:
+   - **Dataset CSV**: `sample_data/dataset.csv`
+   - **Inspection XML**: `sample_data/inspection.xml`
+   - **Image Folder**: `sample_data`
+   - **Output JSON**: `outputs/result.json`
+2. Click **1. Prepare** → Validates and matches images with inspection records.
+3. Click **2. Prepare + Verify** → Checks golden pairing and defect ROI crops.
+4. Click **3. Run Agentic Workflow**:
+   - Agent 1 executes feature and defect classification.
+   - Saves results and indexes to Qdrant (Port 8000).
+   - If any sample is uncertain or marked `REVIEW_REQUIRED`, it is **automatically escalated to Agent 2 (Port 8001)**.
+   - The review diagnosis, evidence verification, and final verdict stream directly into the UI log.
 
-| Flag | Default | Description |
+---
+
+## Headless CLI Execution
+
+### Running Batch CLI Inspections
+To run the inspection pipeline without the GUI:
+```cmd
+python main.py --dataset sample_data/dataset.csv --xml sample_data/inspection.xml --image-root sample_data --agent2-url http://127.0.0.1:8001
+```
+
+### Inspecting Runs with `adc_rest.py`
+Query stored runs and review cases from the database:
+```cmd
+# List all review cases for a specific run ID
+python adc_rest.py reviews <RUN_ID>
+
+# Import an existing result JSON into the database
+python adc_rest.py import example_result.json --run-id run-test-001
+```
+
+### Triggering Reviews via `auto_review.py`
+If running outside the UI, trigger all pending reviews from the latest run in `outputs/`:
+```cmd
+python auto_review.py
+```
+
+---
+
+## Agent 2 MCP Tools Specification
+
+Agent 2 (`src/agent2_explainability/mcp/agent2_mcp_server.py`) defines 4 tools:
+
+| Tool Name | Technology | Description |
 |---|---|---|
-| `--limit N` | `None` (All) | Restricts execution to the first $N$ samples (ideal for smoke testing). |
-| `--batch-size B` | `5` | Splits samples into mini-batches of size $B$ to prevent timeouts. |
-| `--confidence-threshold` | `0.85` | Baseline confidence gate threshold; below this triggers Agent 2 review. |
-| `--populate-vector-db` | `False` | Indexes all loaded samples into the local Qdrant database before inference. |
-| `--qdrant-path` | `qdrant_db` | Target directory for the local embedded Qdrant vector database. |
-| `--image-root` | `data/inputs` | Base folder used for recursive image discovery and path remapping. |
-| `--dataset` | `data/sample_data/dataset.csv` | Path to inspection metadata CSV. |
-| `--xml` | `data/sample_data/inspection.xml` | Path to AOI inspection XML. |
-| `--agent2-url` | `http://127.0.0.1:8001` | A2A server URL for explainability delegation. |
-| `--output` | `outputs/result.json` | Destination path for the unified diagnostic JSON report. |
-
-### Common CLI Examples
-
-```bash
-# 1. Quick test run with 10 images in batches of 5
-python main.py --limit 10 --batch-size 5
-
-# 2. Populate Qdrant vector database and run 25 samples
-python main.py --populate-vector-db --limit 25 --batch-size 5
-
-# 3. High-confidence production run across all board folders
-python main.py --confidence-threshold 0.90 --batch-size 20 --output outputs/prod_run.json
-```
+| `case_context_retrieval_tool` | Qdrant Vector Store | Retrieves historical precedents for the component reference and cross-references IPC-A-610 Class 3 standards. |
+| `visual_evidence_tool` | Local LLaVA / Ollama | Analyzes the ROI crop using a multimodal vision model across the 7 IPC defect classes. |
+| `measurement_evidence_tool` | Telemetry Engine | Fetches ICT electrical telemetry (resistance, capacitance, laser profile height). |
+| `grounding_and_self_check_tool` | OpenAI GPT-4o | Synthesizes visual and physical evidence to ensure strict JSON output and avoid hallucinations. |
 
 ---
 
-## 🔍 Robust Image Discovery & Path Resolution
+## Troubleshooting
 
-The runner automatically crawls the image filesystem without needing rigid manual configurations:
+### 1. `[WinError 10061] No connection could be made because target machine actively refused it`
+* **Cause**: Qdrant is not running.
+* **Fix**: Ensure Docker Desktop is active, then run `docker compose -f compose.qdrant.yaml up -d`. Check `http://127.0.0.1:6333/dashboard`.
 
-1. **Auto-Exploration Across Boards:** Recursively searches `data/inputs` across all 122+ board assembly folders (`06-200036-02`, etc.), automatically parsing component references and defect labels from filenames and directory structures.
-2. **Smart Golden-Pairing:** Automatically identifies the sibling `Golden/` directory relative to any defect image, locating the corresponding reference image by component ID.
-3. **Legacy Windows Path Remapping:** Dynamically recovers relocated images by matching subpaths below `usi` or searching recursively by basename.
-4. **Canonical Absolute Path Transmission:** Relative paths are resolved to absolute canonical paths before being dispatched over A2A HTTP, preventing missing-image errors between independent terminal sessions.
+### 2. `TypeError: Router.__init__() got an unexpected keyword argument 'on_startup'`
+* **Cause**: Running from Anaconda's global `(base)` environment instead of the project's environment.
+* **Fix**: Run `conda activate pcb_inspector`.
 
----
-
-## 🧪 Running Unit Tests
-
-The test suite runs using Python's built-in `unittest` module without requiring external packages like `pytest`:
-
-```bash
-python tests/test_agent1_fast_path.py
-```
-
-*Expected output:*
-```text
-test_agent1_escalates_when_confidence_below_threshold (__main__.TestAgent1FastPath) ...  -> test_agent1_escalates_when_confidence_below_threshold: PASSED (Escalated to Agent 2)
-ok
-test_agent1_fast_path_high_confidence (__main__.TestAgent1FastPath) ... 
- -> test_agent1_fast_path_high_confidence: PASSED (Agent 2 call_count == 0)
-ok
-
-----------------------------------------------------------------------
-Ran 2 tests in 0.001s
-
-OK
-```
-
----
-
-## 📊 Sample Unified Output (`outputs/result.json`)
-
-```json
-{
-  "summary": {
-    "total_samples": 3,
-    "agent1_auto_accepted": 1,
-    "escalated_to_agent2": 2,
-    "agent2_resolved": 2,
-    "human_review_required": 0
-  },
-  "results": [
-    {
-      "sample_id": "06-200036-02_C636_Board1_C636_Body_06-200036-02_MissingPart_3",
-      "board_id": "06-200036-02",
-      "component_id": "C636",
-      "resolved_image_path": "C:/Users/.../data/inputs/06-200036-02/Body/Passed/Board1_C636_Body_...MissingPart_3.jpg",
-      "resolved_golden_path": "C:/Users/.../data/inputs/06-200036-02/Body/Golden/Board1_C636_Body_...Golden.jpg",
-      "baseline_inference": {
-        "feature_class": "Body",
-        "defect_class": "MissingPart",
-        "confidence": 0.65
-      },
-      "gate_decision": "REVIEW_REQUIRED",
-      "agent2_review": {
-        "predicted_defect": "missing part",
-        "confidence": 0.98,
-        "self_check_passed": true,
-        "contradiction_detected": false,
-        "diagnosis": "Physical open circuit (ICT FAIL) and laser height (0.80 µm) confirm missing part.",
-        "ipc_citations": [
-          "IPC-A-610 Class 2 Section 8.3"
-        ],
-        "visual_evidence": "Rectangular solder land pattern is bare silver. Ceramic component body is absent."
-      },
-      "final_verdict": "missing part",
-      "workflow_status": "COMPLETED"
-    },
-    {
-      "sample_id": "06-200036-02_C978_Board1_C978_Body_06-200036-02_Shift_4",
-      "board_id": "06-200036-02",
-      "component_id": "C978",
-      "resolved_image_path": "C:/Users/.../data/inputs/06-200036-02/Body/Passed/Board1_C978_Body_...Shift_4.jpg",
-      "resolved_golden_path": "C:/Users/.../data/inputs/06-200036-02/Body/Golden/Board1_C978_Body_...Golden.jpg",
-      "baseline_inference": {
-        "feature_class": "Body",
-        "defect_class": "Shift",
-        "confidence": 0.70
-      },
-      "gate_decision": "REVIEW_REQUIRED",
-      "agent2_review": {
-        "predicted_defect": "shifted",
-        "confidence": 0.95,
-        "self_check_passed": true,
-        "contradiction_detected": false,
-        "diagnosis": "Side overhang (62.0%) exceeds IPC-A-610 Class 2 maximum 50% limit.",
-        "ipc_citations": [
-          "IPC-A-610 Class 2 Section 8.3.2"
-        ],
-        "visual_evidence": "Component body is misaligned laterally past the termination pad edge."
-      },
-      "final_verdict": "shifted",
-      "workflow_status": "COMPLETED"
-    }
-  ]
-}
-```
-
----
-
-## 🛠️ Production Extensibility
-
-* **Human-in-the-Loop (HITL):** If Agent 2 detects an irreconcilable visual/physical contradiction or if `self_check_passed == False`, the workflow status becomes `HUMAN_QA_REQUIRED` and routes the case to the QA review queue.
-* **Continuous Learning:** Confirmed escalated edge cases can be indexed back into the local `qdrant_db` collection to expand historical retrieval accuracy for future runs.
-* **Industrial SMT Line Integration:** In `generate_telemetry.py` or `dataset_preparation.py`, direct SECS/GEM or OPC-UA protocols can be hooked up to stream real-time measurements from inline 3D AOI and ICT equipment.
+### 3. `HTTP 422: No defect classification available`
+* **Cause**: Agent 1 flagged `FEATURE_CLASSIFICATION_UNCERTAIN` and skipped defect classification.
+* **Fix**: Ensure `adc_shared/agent2_api.py` includes the fallback to `sample.get('machine_defect')` so Agent 2 has a defect category to audit.
