@@ -1,8 +1,7 @@
 """
-Unified End-to-End PCB Inspection Runner.
-Recursively explores inspection images across all board assemblies in data/inputs,
-evaluates policy gates, and dispatches ambiguous cases to Agent 2 via A2A protocol.
-Supports vector database indexing into local Qdrant (qdrant_db).
+Unified End-to-End PCB Inspection Runner (Pure REST API).
+Recursively explores inspection images across all board assemblies,
+evaluates policy gates, and dispatches ambiguous cases to Agent 2 via HTTP REST API.
 """
 
 from __future__ import annotations
@@ -40,15 +39,10 @@ logger = logging.getLogger("UnifiedRunner")
 
 
 def normalize_defect_label(label: Optional[str]) -> str:
-    """
-    Normalizes PascalCase, camelCase, and snake_case labels into the standard 
-    7 IPC-A-610 defect taxonomy classes:
-    ['missing part', 'shifted', 'foreign material', 'tombstone', 'solder insufficient', 'wrong part', 'no defect']
-    """
+    """Normalizes labels into standard IPC defect classes."""
     if not label:
         return "no defect"
     s = label.strip()
-    # PascalCase to spaced words (e.g. MissingPart -> Missing Part)
     s = re.sub(r'(?<!^)(?=[A-Z])', ' ', s).lower()
     s = s.replace("_", " ").replace("-", " ")
     s = " ".join(s.split())
@@ -71,18 +65,22 @@ def normalize_defect_label(label: Optional[str]) -> str:
 
 
 def check_agent2_health(agent2_url: str) -> bool:
-    """Verifies that the Agent 2 Explainability A2A server is reachable."""
+    """Verifies that the Agent 2 Explainability REST API is reachable."""
     try:
-        resp = requests.get(f"{agent2_url.rstrip('/')}/.well-known/agent.json", timeout=2.5)
-        return resp.status_code == 200
+        resp = requests.get(f"{agent2_url.rstrip('/')}/health", timeout=3.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("status") == "ok" and data.get("execution_enabled", True)
+        return False
     except Exception:
         return False
 
 
-def call_agent2_a2a(agent2_url: str, sample: Dict[str, Any], baseline_result: Dict[str, Any]) -> Dict[str, Any]:
-    """Delegates a case to Agent 2 via standard A2A JSON task request."""
+def call_agent2_rest(agent2_url: str, sample: Dict[str, Any], baseline_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Delegates a case to Agent 2 via HTTP REST API (POST /reviews)."""
     task_payload = {
-        "task_type": "pcb.explainability.audit",
+        "run_id": "standalone_cli",
+        "sample_id": sample.get("sample_id", "UNKNOWN"),
         "parameters": {
             "board_id": sample.get("board_id", "UNKNOWN"),
             "component_ref": sample.get("component_id", "UNKNOWN"),
@@ -94,25 +92,21 @@ def call_agent2_a2a(agent2_url: str, sample: Dict[str, Any], baseline_result: Di
             "aoi_measurements": sample.get("failed_inspections", {})
         }
     }
-    resp = requests.post(f"{agent2_url.rstrip('/')}/a2a/tasks", json=task_payload, timeout=60.0)
+    resp = requests.post(f"{agent2_url.rstrip('/')}/reviews", json=task_payload, timeout=90.0)
     if resp.status_code == 200:
         data = resp.json()
-        return data.get("artifact") or data.get("result", {})
-    raise RuntimeError(f"Agent 2 call failed [{resp.status_code}]: {resp.text}")
+        result_wrap = data.get("result", data)
+        return result_wrap.get("output", result_wrap)
+    raise RuntimeError(f"Agent 2 REST call failed [{resp.status_code}]: {resp.text}")
 
 
-def auto_discover_dataset(image_root: str = "data/inputs") -> List[Dict[str, Any]]:
-    """
-    Recursively scans the entire directory hierarchy for all board assemblies.
-    Extracts defect images (skipping Golden folders) and automatically matches
-    them with their corresponding Golden image in the sibling 'Golden/' directory.
-    """
+def auto_discover_dataset(image_root: str) -> List[Dict[str, Any]]:
+    """Recursively scans directory hierarchy for PCB inspection items."""
     root_path = Path(image_root)
     if not root_path.exists():
         logger.warning(f"Image directory '{image_root}' does not exist.")
         return []
 
-    # Optional: Load pre-generated telemetry lookup if available
     telemetry_map = {}
     tel_file = Path("outputs/telemetry_by_image.json")
     if tel_file.is_file():
@@ -122,26 +116,21 @@ def auto_discover_dataset(image_root: str = "data/inputs") -> List[Dict[str, Any
         except Exception:
             pass
 
-    # Gather all image files
     all_images = list(root_path.rglob("*.jpg")) + list(root_path.rglob("*.png"))
     samples = []
 
     for img in sorted(all_images):
         fname = img.name
-        # Skip reference images from being processed as defect inspection targets
         if "golden" in img.parts or "golden" in fname.lower():
             continue
 
-        # Extract Board ID from directory hierarchy (data/inputs/<board_id>/...)
         rel_parts = img.relative_to(root_path).parts
         board_id = rel_parts[0] if len(rel_parts) > 1 else "UNKNOWN_BOARD"
 
-        # Parse filename tokens (e.g. Board1_C636_Body_06-200036-02_..._MissingPart_3.jpg)
         name_parts = img.stem.split("_")
         comp_id = name_parts[1] if len(name_parts) > 1 else "COMP"
         feature_type = name_parts[2] if len(name_parts) > 2 and name_parts[2] in ["Body", "Lead", "Text"] else "Body"
 
-        # Determine preliminary defect hint from filename
         fname_lower = fname.lower()
         if "missing" in fname_lower:
             defect_hint = "MissingPart"
@@ -162,7 +151,6 @@ def auto_discover_dataset(image_root: str = "data/inputs") -> List[Dict[str, Any
             defect_hint = "NoDefect"
             base_conf = 0.98
 
-        # --- Smart Golden Pairing ---
         golden_path = None
         golden_dir = img.parent.parent / "Golden"
         if golden_dir.is_dir():
@@ -170,7 +158,6 @@ def auto_discover_dataset(image_root: str = "data/inputs") -> List[Dict[str, Any
             if matches:
                 golden_path = str(matches[0].resolve())
 
-        # Fallback Golden lookup anywhere in the board folder
         if not golden_path:
             board_dir = root_path / board_id
             if board_dir.is_dir():
@@ -178,7 +165,6 @@ def auto_discover_dataset(image_root: str = "data/inputs") -> List[Dict[str, Any
                 if matches:
                     golden_path = str(matches[0].resolve())
 
-        # Physical measurements (from telemetry file or heuristic)
         measurements = telemetry_map.get(fname, {})
         if not measurements:
             if defect_hint == "MissingPart":
@@ -207,7 +193,7 @@ def auto_discover_dataset(image_root: str = "data/inputs") -> List[Dict[str, Any
 
 
 def load_samples(dataset_csv: str, inspection_xml: str, image_root: str) -> List[Dict[str, Any]]:
-    """Loads samples from dataset.csv/inspection.xml if present, else auto-explores data/inputs."""
+    """Loads samples from dataset.csv/inspection.xml if present, else auto-explores image directory."""
     csv_path = Path(dataset_csv)
     xml_path = Path(inspection_xml)
 
@@ -219,80 +205,66 @@ def load_samples(dataset_csv: str, inspection_xml: str, image_root: str) -> List
             if prepared:
                 return prepared
         except Exception as e:
-            logger.warning(f"Could not load via dataset_preparation service: {e}. Switching to auto-exploration.")
+            logger.warning(f"Could not load via dataset_preparation: {e}. Switching to auto-exploration.")
 
-    # Automatically explore the image directory
     return auto_discover_dataset(image_root=image_root)
 
 
 def main():
-    # Detect default paths
-    default_csv = "data/sample_data/dataset.csv" if Path("data/sample_data/dataset.csv").exists() else "sample_data/dataset.csv"
-    default_xml = "data/sample_data/inspection.xml" if Path("data/sample_data/inspection.xml").exists() else "sample_data/inspection.xml"
-    default_img_root = "data/inputs" if Path("data/inputs").exists() else "inputs"
+    default_csv = "sample_data/dataset.csv" if Path("sample_data/dataset.csv").exists() else "data/sample_data/dataset.csv"
+    default_xml = "sample_data/inspection.xml" if Path("sample_data/inspection.xml").exists() else "data/sample_data/inspection.xml"
+    
+    # Auto-detect image folder
+    if Path("inputs").exists():
+        default_img_root = "inputs"
+    elif Path("sample_data").exists():
+        default_img_root = "sample_data"
+    else:
+        default_img_root = "inputs"
 
-    parser = argparse.ArgumentParser(description="Multi-Agent PCB Inspection System")
+    parser = argparse.ArgumentParser(description="Multi-Agent PCB Inspection System (Pure REST API)")
     parser.add_argument("--dataset", default=default_csv, help="Path to dataset.csv")
     parser.add_argument("--xml", default=default_xml, help="Path to AOI inspection.xml")
-    parser.add_argument("--image-root", default=default_img_root, help="Root folder for PCB image files")
-    parser.add_argument("--agent2-url", default="http://127.0.0.1:8001", help="Agent 2 A2A Server URL")
-    parser.add_argument("--output", default="outputs/result.json", help="Destination path for final audit log")
+    parser.add_argument("--image-root", default=default_img_root, help="Root folder for PCB images")
+    parser.add_argument("--agent2-url", default="http://127.0.0.1:8001", help="Agent 2 REST API URL")
+    parser.add_argument("--output", default="outputs/result.json", help="Path for final result JSON")
     parser.add_argument("--confidence-threshold", type=float, default=0.85, help="Minimum baseline confidence")
-    parser.add_argument("--limit", type=int, default=None, help="Maximum number of samples to process (e.g., --limit 10)")
-    parser.add_argument("--batch-size", type=int, default=5, help="Number of samples per batch (e.g., --batch-size 5)")
-    
-    # --- Vector Database Flags ---
-    parser.add_argument(
-        "--populate-vector-db",
-        action="store_true",
-        help="Index all loaded/discovered samples into the local Qdrant vector database (qdrant_db)"
-    )
-    parser.add_argument(
-        "--qdrant-path",
-        default="qdrant_db",
-        help="Target folder for local embedded Qdrant database (default: qdrant_db)"
-    )
+    parser.add_argument("--limit", type=int, default=None, help="Max samples to process")
+    parser.add_argument("--batch-size", type=int, default=5, help="Batch size")
+    parser.add_argument("--populate-vector-db", action="store_true", help="Index into local Qdrant")
+    parser.add_argument("--qdrant-path", default="qdrant_db", help="Folder for local Qdrant")
 
     args = parser.parse_args()
 
     print("=" * 75)
-    print(" UNIFIED MULTI-AGENT PCB INSPECTION SYSTEM")
+    print(" UNIFIED MULTI-AGENT PCB INSPECTION SYSTEM (REST API)")
     print("=" * 75)
 
-    # 1. Health check Agent 2 A2A microservice
+    # 1. Health check Agent 2 REST API
     agent2_online = check_agent2_health(args.agent2_url)
     if agent2_online:
-        logger.info(f"Agent 2 (Explainability Server) is ONLINE at {args.agent2_url}")
+        logger.info(f"Agent 2 REST API is ONLINE at {args.agent2_url}")
     else:
-        logger.warning(f"Agent 2 NOT responding at {args.agent2_url}. Escalated cases will be marked for Human Review.")
+        logger.warning(f"Agent 2 REST API NOT responding at {args.agent2_url}. Escalated cases will be marked for Human Review.")
 
-    # 2. Ingest Dataset (Auto-Exploration or CSV/XML)
+    # 2. Ingest Dataset
     samples = load_samples(args.dataset, args.xml, args.image_root)
-
     if not samples:
         logger.error(f"No valid inspection images found in '{args.image_root}'. Exiting.")
         return
 
-    # --- Step 2.5: Populate Vector Database if requested ---
-    if args.populate_vector_db:
-        if populate_qdrant_db is not None:
-            logger.info(f"Indexing {len(samples)} samples into Qdrant vector DB at '{args.qdrant_path}'...")
-            try:
-                indexed_count = populate_qdrant_db(samples, db_path=args.qdrant_path)
-                logger.info(f" -> Qdrant vector DB successfully indexed with {indexed_count} samples.")
-            except Exception as ex:
-                logger.error(f" -> Failed to populate Qdrant vector DB: {ex}")
-        else:
-            logger.warning(" -> Qdrant indexer module ('populate_qdrant_db') not found. Skipping vector indexing.")
+    # Index into vector DB if requested
+    if args.populate_vector_db and populate_qdrant_db is not None:
+        try:
+            indexed = populate_qdrant_db(samples, db_path=args.qdrant_path)
+            logger.info(f"Indexed {indexed} samples into Qdrant.")
+        except Exception as ex:
+            logger.error(f"Vector DB indexing failed: {ex}")
 
-    # Apply sample limit (if requested)
     if args.limit and args.limit > 0:
         samples = samples[:args.limit]
-        logger.info(f"Limiting execution to first {len(samples)} samples.")
 
     batch_size = max(1, args.batch_size)
-
-    # Global accumulation across all batches
     counters = {
         "total_samples": len(samples),
         "agent1_auto_accepted": 0,
@@ -302,15 +274,15 @@ def main():
     }
     final_results: List[Dict[str, Any]] = []
 
-    def get_batches(lst: List[Any], n: int):
+    def get_batches(lst, n):
         for i in range(0, len(lst), n):
             yield lst[i:i + n]
 
     batch_count = max(1, (len(samples) + batch_size - 1) // batch_size)
 
-    # 3. Process batch by batch
+    # 3. Process batches
     for batch_num, batch in enumerate(get_batches(samples, batch_size), start=1):
-        logger.info(f"==================== Running Batch {batch_num}/{batch_count} ({len(batch)} items) ====================")
+        logger.info(f"=== Running Batch {batch_num}/{batch_count} ({len(batch)} items) ===")
 
         for s in batch:
             comp_id = s.get("component_id") or s.get("component_ref", "UNKNOWN")
@@ -319,19 +291,6 @@ def main():
             golden_path = s.get("golden_image_path")
             feat_type = s.get("feature_type", "Body")
 
-            logger.info(f"Processing component: {comp_id} (Board: {board_id})")
-
-            if defect_path and Path(defect_path).is_file():
-                logger.info(f" -> Defect image: {Path(defect_path).name}")
-            else:
-                logger.warning(" -> Defect image missing on disk.")
-
-            if golden_path and Path(golden_path).is_file():
-                logger.info(f" -> Golden image: {Path(golden_path).name}")
-            else:
-                logger.info(" -> Golden image: None (Unpaired)")
-
-            # --- Agent 1 Baseline Inference ---
             defect_class = s.get("defect_hint", "NoDefect")
             confidence = s.get("baseline_confidence", 0.95)
 
@@ -358,31 +317,28 @@ def main():
             }
 
             if is_confident:
-                logger.info(f" -> Auto-Accepted by Policy Engine (Confidence: {baseline['confidence']:.2f})")
                 counters["agent1_auto_accepted"] += 1
             else:
-                logger.info(f" -> REVIEW_REQUIRED (Confidence: {baseline['confidence']:.2f} < {args.confidence_threshold})")
                 counters["escalated_to_agent2"] += 1
 
                 if agent2_online:
                     try:
-                        logger.info(" -> Delegating task to Agent 2 via A2A protocol...")
-                        a2a_artifact = call_agent2_a2a(args.agent2_url, s, baseline)
-                        audit_entry["agent2_review"] = a2a_artifact
-                        
-                        agent2_verdict = normalize_defect_label(a2a_artifact.get("predicted_defect"))
+                        logger.info(f" -> Delegating sample {audit_entry['sample_id']} to Agent 2 via REST API...")
+                        review_artifact = call_agent2_rest(args.agent2_url, s, baseline)
+                        audit_entry["agent2_review"] = review_artifact
+
+                        agent2_verdict = normalize_defect_label(review_artifact.get("predicted_defect"))
                         audit_entry["final_verdict"] = agent2_verdict
 
-                        if a2a_artifact.get("self_check_passed"):
+                        if review_artifact.get("self_check_passed", True):
                             audit_entry["workflow_status"] = "COMPLETED"
                             counters["agent2_resolved"] += 1
-                            logger.info(f" -> Agent 2 Grounded Verdict: '{agent2_verdict}' | {a2a_artifact.get('diagnosis')}")
+                            logger.info(f" -> Agent 2 REST Verdict: '{agent2_verdict}' | {review_artifact.get('diagnosis')}")
                         else:
                             audit_entry["workflow_status"] = "HUMAN_QA_REQUIRED"
                             counters["human_review_required"] += 1
-                            logger.warning(" -> Agent 2 Self-Check FAILED. Routed to QA Engineer.")
                     except Exception as ex:
-                        logger.error(f" -> A2A Escalation failed: {ex}")
+                        logger.error(f" -> Agent 2 REST Escalation failed: {ex}")
                         audit_entry["workflow_status"] = "HUMAN_QA_REQUIRED"
                         counters["human_review_required"] += 1
                 else:
@@ -397,13 +353,12 @@ def main():
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump({"summary": counters, "results": final_results}, f, indent=2)
 
-    # Print Summary Report
     print("\n" + "=" * 75)
-    print(" INSPECTION PIPELINE EXECUTION SUMMARY")
+    print(" INSPECTION PIPELINE SUMMARY (REST ONLY)")
     print("=" * 75)
     print(f" Total Samples Evaluated    : {counters['total_samples']}")
     print(f" Agent 1 Fast-Path Accepted : {counters['agent1_auto_accepted']}")
-    print(f" Escalated to Agent 2 (A2A) : {counters['escalated_to_agent2']}")
+    print(f" Escalated to Agent 2 (REST): {counters['escalated_to_agent2']}")
     print(f" Agent 2 Grounded & Resolved: {counters['agent2_resolved']}")
     print(f" Human Review Required      : {counters['human_review_required']}")
     print(f" Detailed Audit JSON saved  : {output_file.resolve()}")
