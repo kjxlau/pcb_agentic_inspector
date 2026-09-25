@@ -1,8 +1,10 @@
-# Agentic ADC – Two-Stage Multi-Agent PCB Inspection System
+# Agentic ADC – Two-Stage Multi-Agent PCB Inspection System (Pure REST API)
 
 An end-to-end multi-agent visual inspection and explainability pipeline for printed circuit board (PCB) surface mount assembly manufacturing.
 
-The system decouples **Fast-Path Automated Defect Classification (Agent 1 Orchestrator)** from deep **Explainability & Root-Cause Auditing (Agent 2)** via a persistent REST and Vector Database layer (Qdrant), complete with an interactive **Human-in-the-Loop (HitL)** conflict resolution engine.
+The system decouples **Fast-Path Automated Defect Classification (Agent 1 Orchestrator)** from deep **Explainability & Root-Cause Auditing (Agent 2)** via a persistent REST and Vector Database layer (Qdrant), complete with an interactive **Human-in-the-Loop (HitL)** conflict resolution engine. 
+
+> **Architecture Note:** All inter-agent communication uses **pure HTTP REST APIs**. Legacy A2A protocols have been completely discarded.
 
 ---
 
@@ -14,9 +16,9 @@ pcb_agentic_inspector/
 ├── compose.qdrant.yaml               # Docker Compose file for Qdrant vector database
 ├── requirements.txt                  # Core dependencies (Tkinter, PyTorch, etc.)
 ├── requirements-rest.txt             # REST API and data layer dependencies
-├── auto_review.py                    # Standalone batch review script
+├── auto_review.py                    # Standalone batch review script (REST)
 ├── adc_rest.py                       # CLI utility for database queries & runs
-├── main.py                           # Headless batch inspection pipeline
+├── main.py                           # Headless batch inspection pipeline (REST)
 ├── inputs/                           # PCB image directory (Golden & Defect crops)
 ├── outputs/                          # Generated inspection results & run ID records
 ├── adc_shared/                       # Shared microservices layer
@@ -44,12 +46,12 @@ pcb_agentic_inspector/
 ```text
 ┌───────────────────────────────────────────────────────────────────────────┐
 │                          AGENT 1: ORCHESTRATOR                            │
-│  • src/agent1_orchestrator/ui.py (Interactive GUI) or main.py (CLI)       │
+│  • src/agent1_orchestrator/ui.py (GUI) or main.py (Headless CLI)          │
 │  • Dataset Preparation & Verification (Relative 'inputs/...' paths)       │
 │  • Two-Stage Inference (Feature Classifier → Defect Classifier)           │
 │  • Policy Engine & LLM Planner (OpenAI / Deterministic)                   │
 └─────────────────────────────────────┬─────────────────────────────────────┘
-                                      │ Saves Run State (JSON)
+                                      │ Saves Run State via HTTP POST /runs
                                       ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
 │                     SHARED PERSISTENCE & DATA LAYER                       │
@@ -57,10 +59,10 @@ pcb_agentic_inspector/
 │  • compose.qdrant.yaml (Qdrant Vector DB on Port 6333)                    │
 │  • adc_shared/repository.py & client.py (Vector storage & retrieval)      │
 └─────────────────────────────────────┬─────────────────────────────────────┘
-                                      │ Auto-Dispatches "REVIEW_REQUIRED" Cases
+                                      │ Auto-Dispatches via POST /reviews
                                       ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│                   AGENT 2: EXPLAINABILITY REVIEW AGENT                    │
+│                   AGENT 2: EXPLAINABILITY REST API                        │
 │  • adc_shared/agent2_api.py (REST Service on Port 8001)                   │
 │  • src/agent2_explainability/pipeline/review_graph.py (LangGraph Flow)    │
 │  • src/agent2_explainability/mcp/agent2_mcp_server.py (4 MCP Tools):      │
@@ -75,7 +77,7 @@ pcb_agentic_inspector/
 │                      HUMAN-IN-THE-LOOP (HitL) ENGINE                      │
 │  • If Agent 1 == Agent 2  ──► CONSENSUS (Auto-Approved into Database)     │
 │  • If Agent 1 != Agent 2  ──► MODAL CONFLICT RESOLUTION DIALOG            │
-│     - Side-by-side evidence inspection                                    │
+│     - Side-by-side model comparison                                       │
 │     - Operator selects verdict (Agent 1, Agent 2, or custom IPC class)   │
 │     - Operator notes recorded and saved to Qdrant (HUMAN_RESOLVED)        │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -87,7 +89,7 @@ pcb_agentic_inspector/
 
 1. **Windows 10/11** or **Linux** with **Anaconda / Miniconda**.
 2. **Git**.
-3. **Docker Desktop** (required to run the Qdrant vector database container).
+3. **Docker Desktop** (required for the local Qdrant vector database container).
 4. **OpenAI API Key** (for LLM planning and Agent 2 GPT-4o grounding).
 5. *(Optional)* **Ollama with LLaVA** (for local vision analysis; heuristic fallback enabled if offline):
    ```bash
@@ -100,7 +102,7 @@ pcb_agentic_inspector/
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/kjxlau/pcb_agentic_inspector.git
+git clone <YOUR_REPOSITORY_URL>
 cd pcb_agentic_inspector
 ```
 
@@ -116,7 +118,7 @@ pip install -r requirements.txt -r requirements-rest.txt
 ```
 
 ### 4. Configure `.env`
-Create a `.env` file in the root of the cloned repository (or copy `.env.example` if available):
+Create a `.env` file in the root of the project:
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4o
@@ -130,11 +132,11 @@ ADC_ENABLE_AGENT2=1
 
 ## 5. Local Execution (3-Terminal Workflow)
 
-Open three separate terminals in the `pcb_agentic_inspector` directory:
+Open three separate terminals inside the `pcb_agentic_inspector` directory:
 
 ### Terminal 1: Start Qdrant & Shared Data API
-1. Ensure **Docker Desktop** is open and active.
-2. In your project root:
+1. Ensure **Docker Desktop** is running.
+2. In your terminal, start the Qdrant container:
    ```cmd
    conda activate pcb_inspector
    docker compose -f compose.qdrant.yaml up -d
@@ -148,20 +150,20 @@ Open three separate terminals in the `pcb_agentic_inspector` directory:
 
 ---
 
-### Terminal 2: Start Agent 2 Explainability API
-In your project root:
+### Terminal 2: Start Agent 2 REST API
+In your second terminal:
 ```cmd
 conda activate pcb_inspector
 set ADC_ENABLE_AGENT2=1
 set ADC_DATA_URL=http://127.0.0.1:8000
 python -m uvicorn adc_shared.agent2_api:app --host 127.0.0.1 --port 8001 --workers 1
 ```
-*Verify in browser:* `http://127.0.0.1:8001/health` (returns `{"status":"ok","execution_enabled":true}`).
+*Verify in browser:* `http://127.0.0.1:8001/health` (returns `{"status":"ok","service":"agent2_rest_api","execution_enabled":true}`).
 
 ---
 
 ### Terminal 3: Launch Agent 1 Orchestrator GUI
-In your project root:
+In your third terminal:
 ```cmd
 conda activate pcb_inspector
 set ADC_DATA_URL=http://127.0.0.1:8000
@@ -183,10 +185,10 @@ python src/agent1_orchestrator/ui.py
 4. Click **3. Run Agentic Workflow**:
    - Agent 1 executes feature and defect classification.
    - Saves run state to Qdrant via `adc_shared/data_api.py`.
-   - Any sample marked `REVIEW_REQUIRED` is **automatically dispatched to Agent 2 (`:8001`)**.
+   - Any sample marked `REVIEW_REQUIRED` is **automatically dispatched to Agent 2 (`:8001`) via HTTP POST**.
 
 ### Conflict Resolution Flow
-* **Consensus**: When Agent 1 and Agent 2 agree on the classification, the result is auto-approved and saved to Qdrant.
+* **Consensus**: When Agent 1 and Agent 2 agree, the classification is auto-approved and saved to Qdrant.
 * **Conflict**: If Agent 1 and Agent 2 disagree, a **Human Review Dialog** modal opens:
   - Displays side-by-side model outputs (`Agent 1` vs `Agent 2`).
   - Displays the full multimodal diagnosis from LLaVA and GPT-4o.
@@ -199,11 +201,48 @@ python src/agent1_orchestrator/ui.py
 
 ---
 
-## 7. Headless & Cloud Execution (CLI / Google Colab)
+## 7. Headless & Cloud Execution (Google Colab / Linux)
 
-> **Note:** Tkinter requires an active X11 display. For headless environments or Google Colab, use the CLI scripts.
+> **Note:** Tkinter requires an active X11 display. For headless environments or Google Colab, use the pure REST CLI script.
+
+### Running in Google Colab (All Services in Background)
+
+In a Colab cell, launch all 3 REST microservices:
+
+```python
+import subprocess, time, httpx, os
+from pathlib import Path
+
+os.environ["PYTHONPATH"] = "."
+os.environ["QDRANT_URL"] = "http://127.0.0.1:6333"
+os.environ["ADC_DATA_URL"] = "http://127.0.0.1:8000"
+os.environ["ADC_AGENT2_URL"] = "http://127.0.0.1:8001"
+os.environ["ADC_ENABLE_AGENT2"] = "1"
+
+# Create symlink so 'inputs' maps to sample_data
+!ln -sf sample_data inputs
+
+# Kill lingering processes on ports
+!fuser -k 6333/tcp 8000/tcp 8001/tcp 2>/dev/null || true
+
+# 1. Qdrant (Port 6333)
+if not Path("qdrant").is_file():
+    !curl -s -L https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+    !chmod +x qdrant
+subprocess.Popen(["./qdrant"], stdout=open("qdrant.log", "w"), stderr=subprocess.STDOUT)
+
+# 2. Shared Data API (Port 8000)
+subprocess.Popen(["python", "-m", "uvicorn", "adc_shared.data_api:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1"], stdout=open("data_api.log", "w"), stderr=subprocess.STDOUT)
+
+# 3. Agent 2 REST API (Port 8001)
+subprocess.Popen(["python", "-m", "uvicorn", "adc_shared.agent2_api:app", "--host", "127.0.0.1", "--port", "8001", "--workers", "1"], stdout=open("agent2.log", "w"), stderr=subprocess.STDOUT)
+
+time.sleep(5)
+print("All background REST services online!")
+```
 
 ### Running Batch Inspections via `main.py`
+In a second cell or terminal:
 ```bash
 python main.py \
   --dataset sample_data/dataset.csv \
@@ -228,41 +267,11 @@ Trigger Agent 2 reviews for the latest run generated in `outputs/`:
 python auto_review.py
 ```
 
-### Running in Google Colab (All 3 Services in Background)
-```python
-import subprocess, time, httpx, os
-from pathlib import Path
-
-os.environ["PYTHONPATH"] = "."
-os.environ["QDRANT_URL"] = "http://127.0.0.1:6333"
-os.environ["ADC_DATA_URL"] = "http://127.0.0.1:8000"
-os.environ["ADC_AGENT2_URL"] = "http://127.0.0.1:8001"
-os.environ["ADC_ENABLE_AGENT2"] = "1"
-
-# Kill lingering processes on ports
-!fuser -k 6333/tcp 8000/tcp 8001/tcp 2>/dev/null || true
-
-# 1. Start Qdrant Standalone Binary
-if not Path("qdrant").is_file():
-    !curl -s -L https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-unknown-linux-gnu.tar.gz | tar -xz
-    !chmod +x qdrant
-subprocess.Popen(["./qdrant"], stdout=open("qdrant.log", "w"), stderr=subprocess.STDOUT)
-
-# 2. Start Data API
-subprocess.Popen(["python", "-m", "uvicorn", "adc_shared.data_api:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1"], stdout=open("data_api.log", "w"), stderr=subprocess.STDOUT)
-
-# 3. Start Agent 2 API
-subprocess.Popen(["python", "-m", "uvicorn", "adc_shared.agent2_api:app", "--host", "127.0.0.1", "--port", "8001", "--workers", "1"], stdout=open("agent2.log", "w"), stderr=subprocess.STDOUT)
-
-time.sleep(5)
-print("Background services online! Run 'python main.py' to process inspections.")
-```
-
 ---
 
 ## 8. Agent 2 MCP Tools Specification
 
-Agent 2 (`src/agent2_explainability/mcp/agent2_mcp_server.py`) exposes 4 Model Context Protocol tools:
+Agent 2 (`src/agent2_explainability/mcp/agent2_mcp_server.py`) exposes 4 Model Context Protocol tools to its review pipeline:
 
 | Tool Name | Engine / Backend | Purpose |
 |---|---|---|
@@ -281,8 +290,12 @@ Agent 2 (`src/agent2_explainability/mcp/agent2_mcp_server.py`) exposes 4 Model C
 
 ### 2. `TypeError: Router.__init__() got an unexpected keyword argument 'on_startup'`
 * **Cause**: Running from Anaconda's global `(base)` environment with mismatched FastAPI/Starlette packages.
-* **Fix**: Activate the dedicated environment: `conda activate pcb_inspector`.
+* **Fix**: Activate the project environment: `conda activate pcb_inspector`.
 
 ### 3. `HTTP 422: No defect classification available`
 * **Cause**: Agent 1 encountered feature uncertainty (`FEATURE_CLASSIFICATION_UNCERTAIN`) and skipped defect classification.
 * **Fix**: Ensure `adc_shared/agent2_api.py` includes the fallback to `sample.get('machine_defect')` so Agent 2 has a defect candidate to evaluate.
+
+### 4. `Image directory 'inputs' does not exist`
+* **Cause**: The dataset directory is `sample_data/` instead of `inputs/`.
+* **Fix**: Run `mklink /D inputs sample_data` on Windows, or `ln -s sample_data inputs` on Linux/Colab, or specify `--image-root sample_data`.
