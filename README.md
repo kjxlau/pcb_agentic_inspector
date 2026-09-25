@@ -100,7 +100,7 @@ pcb_agentic_inspector/
 
 ### 1. Clone the Repository
 ```bash
-git clone <YOUR_REPOSITORY_URL>
+git clone https://github.com/kjxlau/pcb_agentic_inspector.git
 cd pcb_agentic_inspector
 ```
 
